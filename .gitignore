@@ -1,0 +1,15 @@
+pretrained_weights
+datasets
+outputs
+*.log
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build artifacts
+*.so
+*.o
+build/
+
