@@ -1,6 +1,7 @@
 pretrained_weights
 datasets
 outputs
+checkpoints
 *.log
 
 # Byte-compiled / optimized / DLL files
@@ -12,4 +13,14 @@ __pycache__/
 *.so
 *.o
 build/
+*.egg-info/
 
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# NAS3R 运行产物
+outputs/
+wandb/
+assets/evaluation_index_re10k.subset.json
