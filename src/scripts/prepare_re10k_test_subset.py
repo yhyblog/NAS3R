@@ -143,24 +143,59 @@ def download_shards(local_dir: Path, shard_names: List[str]) -> List[str]:
     local_test = local_dir / "test"
     local_test.mkdir(parents=True, exist_ok=True)
 
+    # HF 仓库内的 shard 路径通常是 "test/xxx.torch"（也兼容 "re10k/test/xxx.torch"）
     patterns = [f"test/{s}" for s in shard_names] + [f"re10k/test/{s}" for s in shard_names]
-    print(f"[prepare] 使用 snapshot_download 拉取 {len(shard_names)} 个 shard ...")
+    print(f"[prepare] 使用 snapshot_download 拉取 {len(shard_names)} 个 shard → {local_dir}")
     snapshot_download(
         repo_id=REPO_ID,
         repo_type=REPO_TYPE,
-        local_dir=str(local_dir.parent),  # 保留相对目录结构
+        # 重点：把 local_dir 指到数据根（datasets/re10k），这样 HF 的 "test/xxx.torch"
+        # 会落到 "datasets/re10k/test/xxx.torch"，和 loader 期望一致。
+        local_dir=str(local_dir),
         allow_patterns=patterns,
     )
-    # 规整路径：若 snapshot 下载到了 re10k/test/ 则移动到 test/
-    alt = local_dir.parent / "re10k" / "test"
-    if alt.exists() and alt != local_test:
-        for f in alt.glob("*.torch"):
-            target = local_test / f.name
-            if not target.exists():
-                os.replace(f, target)
+
+    # 兜底：若仓库里实际用的是 "re10k/test/..."，文件会落到 local_dir/re10k/test/，
+    # 或者历史上某些版本下到了 local_dir.parent/test/；都规整回 local_test
+    candidates = [
+        local_dir / "re10k" / "test",
+        local_dir.parent / "test",
+        local_dir.parent / "re10k" / "test",
+    ]
+    for alt in candidates:
+        if alt.exists() and alt.resolve() != local_test.resolve():
+            moved = 0
+            for f in alt.glob("*.torch"):
+                target = local_test / f.name
+                if not target.exists():
+                    os.replace(f, target)
+                    moved += 1
+            if moved:
+                print(f"  [regroup] 从 {alt} 搬运 {moved} 个 shard 到 {local_test}")
 
     got = sorted(f.name for f in local_test.glob("*.torch"))
-    print(f"[prepare] 本地 test/*.torch 现有 {len(got)} 个")
+    print(f"[prepare] 本地 {local_test}/*.torch 现有 {len(got)} 个")
+
+    # 若仍为 0，尝试全局扫描 local_dir 及其父目录的子树，打捞可能散落的 .torch
+    if not got:
+        print("[prepare][WARN] 常规位置无 shard，进行全局兜底扫描 ...")
+        search_roots = [local_dir, local_dir.parent]
+        moved = 0
+        for root in search_roots:
+            for f in root.rglob("*.torch"):
+                if f.parent.resolve() == local_test.resolve():
+                    continue
+                target = local_test / f.name
+                if not target.exists():
+                    try:
+                        os.replace(f, target)
+                        moved += 1
+                    except OSError as e:
+                        print(f"    [WARN] move {f} failed: {e}")
+        if moved:
+            print(f"  [regroup] 全局扫描搬运 {moved} 个 shard")
+        got = sorted(f.name for f in local_test.glob("*.torch"))
+        print(f"[prepare] 最终 {local_test}/*.torch 共 {len(got)} 个")
     return got
 
 
