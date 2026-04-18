@@ -292,10 +292,16 @@ run_eval_job() {
         test.save_image="${SAVE_IMAGE}" \
         test.compute_scores=true \
         test.output_path="${out_path}" \
-        data_loader.test.batch_size="${EVAL_BATCH_SIZE}" \
-        data_loader.test.num_workers="${EVAL_NUM_WORKERS}" \
         "${EXTRA_ARGS[@]}" \
         >"${logfile}" 2>&1
+    local rc=$?
+    if [[ ${rc} -ne 0 ]]; then
+        echo ""
+        echo "===== 评测 ${key} 失败，eval.log 末尾 40 行如下 ====="
+        tail -n 40 "${logfile}" || true
+        echo "===== ${key} 日志结束 ====="
+    fi
+    return ${rc}
 }
 
 EVAL_PIDS=()
