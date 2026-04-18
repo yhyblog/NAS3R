@@ -84,10 +84,48 @@ fi
 
 cd "${WORK_DIR}"
 
-# 确保 submodule 就位
+# 确保 submodule 就位（带兜底）
 log "初始化/更新 submodules"
 git submodule sync --recursive || true
-git submodule update --init --recursive || warn "submodule 初始化失败，稍后手动处理"
+git submodule update --init --recursive || warn "git submodule update 失败，稍后会用手动 clone 兜底"
+
+DGR_DIR="submodules/diff-gaussian-rasterization"
+DGR_URL="https://github.com/ranrhuang/diff-gaussian-rasterization.git"
+if [[ ! -f "${DGR_DIR}/setup.py" ]]; then
+    warn "${DGR_DIR} 未就绪，手动 clone ..."
+    rm -rf "${DGR_DIR}"
+    mkdir -p submodules
+    git clone --recurse-submodules -b camera "${DGR_URL}" "${DGR_DIR}" || \
+    git clone --recurse-submodules -b camera \
+        "https://ghproxy.com/${DGR_URL}" "${DGR_DIR}" || \
+    { err "diff-gaussian-rasterization 手动 clone 失败，请检查网络"; exit 1; }
+fi
+
+# GLM 头文件兜底
+GLM_DIR="${DGR_DIR}/third_party/glm"
+if [[ ! -f "${GLM_DIR}/glm/glm.hpp" ]]; then
+    warn "GLM 头文件缺失，下载 ..."
+    rm -rf "${GLM_DIR}"
+    git clone --depth 1 https://github.com/g-truc/glm.git "${GLM_DIR}" || \
+    {
+        mkdir -p "${GLM_DIR}"
+        curl -fsSL https://github.com/g-truc/glm/releases/download/1.0.1/glm-1.0.1-light.zip \
+            -o /tmp/glm.zip && \
+        unzip -qo /tmp/glm.zip -d "$(dirname "${GLM_DIR}")" && rm -f /tmp/glm.zip
+    } || { err "GLM 下载失败"; exit 1; }
+fi
+echo "  [ok] ${DGR_DIR} 就绪"
+
+# ============================ 全局 CUDA 编译参数（丁老师建议：H100=sm_90）============================
+# 为所有后续 CUDA 扩展编译（pytorch3d / diff-gaussian-rasterization）统一指定目标架构。
+# 探测失败时强制 9.0（H100）；可通过 TORCH_CUDA_ARCH_LIST 环境变量覆盖。
+if [[ -z "${TORCH_CUDA_ARCH_LIST:-}" ]]; then
+    DETECTED_ARCH=$(python3 -c "import torch; c=torch.cuda.get_device_capability(0); print(f'{c[0]}.{c[1]}')" 2>/dev/null || echo "9.0")
+    export TORCH_CUDA_ARCH_LIST="${DETECTED_ARCH}"
+fi
+export FORCE_CUDA=1
+export MAX_JOBS="${MAX_JOBS:-8}"
+echo "  [cuda] TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}  MAX_JOBS=${MAX_JOBS}"
 
 # ============================ Step 1: 安装依赖 ============================
 if [[ "${SKIP_INSTALL}" != "1" ]]; then
@@ -108,31 +146,18 @@ if [[ "${SKIP_INSTALL}" != "1" ]]; then
     # scikit-video 社区 fork（原版不兼容 Py3.11+）
     pip install sk-video 2>/dev/null || pip install scikit-video --no-deps 2>/dev/null || true
 
-    # pytorch3d：源码编译
+    # pytorch3d：源码编译（使用全局 TORCH_CUDA_ARCH_LIST）
     if ! python3 -c "import pytorch3d" 2>/dev/null; then
-        log "编译安装 pytorch3d (仅当前 GPU 架构)"
-        GPU_ARCH=$(python3 -c "import torch; c=torch.cuda.get_device_capability(0); print(f'{c[0]}.{c[1]}')" 2>/dev/null || echo 9.0)
-        export TORCH_CUDA_ARCH_LIST="${GPU_ARCH}" FORCE_CUDA=1 MAX_JOBS=8
+        log "编译安装 pytorch3d (arch=${TORCH_CUDA_ARCH_LIST})"
         pip install "git+https://github.com/facebookresearch/pytorch3d.git" --no-build-isolation || \
             warn "pytorch3d 编译失败（评测本身不强依赖，可继续）"
     fi
 
-    # diff-gaussian-rasterization（splatting_cuda decoder 依赖）
-    if [[ -f submodules/diff-gaussian-rasterization/setup.py ]]; then
-        log "编译 diff-gaussian-rasterization"
-        # 确保 GLM 头文件存在
-        if [[ ! -f submodules/diff-gaussian-rasterization/third_party/glm/glm/glm.hpp ]]; then
-            rm -rf submodules/diff-gaussian-rasterization/third_party/glm
-            git clone --depth 1 https://github.com/g-truc/glm.git \
-                submodules/diff-gaussian-rasterization/third_party/glm || \
-                warn "GLM 头文件下载失败"
-        fi
-        pip install -e ./submodules/diff-gaussian-rasterization --no-build-isolation || \
-            { err "diff-gaussian-rasterization 编译失败（评测必需，终止）"; exit 1; }
-    else
-        err "submodules/diff-gaussian-rasterization 未初始化"
-        exit 1
-    fi
+    # diff-gaussian-rasterization：splatting_cuda decoder 必需
+    # submodule + GLM 在脚本顶部已确保就位
+    log "编译 diff-gaussian-rasterization (arch=${TORCH_CUDA_ARCH_LIST})"
+    pip install -e "${DGR_DIR}" --no-build-isolation || \
+        { err "diff-gaussian-rasterization 编译失败（评测必需，终止）"; exit 1; }
 
     pip install -q "huggingface_hub[cli,hf_transfer]" colorama
     log "依赖安装完成 ✓"
