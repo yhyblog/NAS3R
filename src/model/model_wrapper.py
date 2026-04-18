@@ -870,6 +870,10 @@ class ModelWrapper(LightningModule):
             f"video/{name}": wandb.Video(video, fps=30, format="mp4")
         }
 
+        # Skip video logging if wandb is disabled (avoid wandb.log error and _fps attr error)
+        if wandb.run is None:
+            return
+
         # Since the PyTorch Lightning doesn't support video logging, log to wandb directly.
         try:
             wandb.log(visualizations)
@@ -877,7 +881,7 @@ class ModelWrapper(LightningModule):
             assert isinstance(self.logger, LocalLogger)
             for key, value in visualizations.items():
                 tensor = value._prepare_video(value.data)
-                clip = mpy.ImageSequenceClip(list(tensor), fps=value._fps)
+                clip = mpy.ImageSequenceClip(list(tensor), fps=getattr(value, "_fps", 30))
                 dir = LOG_PATH / key
                 dir.mkdir(exist_ok=True, parents=True)
                 clip.write_videofile(
