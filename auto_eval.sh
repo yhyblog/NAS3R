@@ -406,6 +406,16 @@ step4_sanity() {
 }
 
 # ============================ Step 5+6: 评测（并行+重试+串行降级）============================
+# 判断一个模型是否已经成功评测完（用于断点续跑）
+# 检查依据：model_dir 下递归存在 scores_all_avg.json
+is_model_done() {
+    local key="$1"
+    local d="${OUT_ROOT}/${key}"
+    [[ -d "${d}" ]] || return 1
+    find "${d}" -name "scores_all_avg.json" -type f 2>/dev/null | grep -q . && return 0
+    return 1
+}
+
 step5_evaluate() {
     log "Step 5: 并行评测 4 个 checkpoint"
 
@@ -414,33 +424,47 @@ step5_evaluate() {
     info "可用 GPU 数: ${NUM_GPUS}"
     [[ "${NUM_GPUS}" -lt 1 ]] && { err "没有 GPU"; return 1; }
 
-    # 清理旧输出（保留 _sanity 已删除）
+    # 断点续跑：已完成的模型不重跑；FORCE_RERUN=1 可强制全部重跑
+    local todo=()
     for k in "${KEY_ORDER[@]}"; do
-        rm -rf "${OUT_ROOT}/${k}"
+        if [[ "${FORCE_RERUN:-0}" != "1" ]] && is_model_done "${k}"; then
+            ok "${k} 已有 scores_all_avg.json，跳过（设 FORCE_RERUN=1 可强制重跑）"
+        else
+            # 只清理该模型目录，不碰已完成的
+            rm -rf "${OUT_ROOT}/${k}"
+            todo+=("${k}")
+        fi
     done
 
+    if [[ "${#todo[@]}" -eq 0 ]]; then
+        ok "所有 4 个 checkpoint 都已完成评测，无需重跑"
+        return 0
+    fi
+
+    info "本次将评测: ${todo[*]}"
+
     local mode="parallel"
-    [[ "${FORCE_SERIAL}" == "1" || "${NUM_GPUS}" -lt 4 ]] && mode="serial"
+    [[ "${FORCE_SERIAL}" == "1" || "${NUM_GPUS}" -lt ${#todo[@]} ]] && mode="serial"
 
     if [[ "${mode}" == "parallel" ]]; then
-        info "模式: parallel (每张 H100 一个模型)"
+        info "模式: parallel (每卡一个模型)"
         local pids=()
-        for i in "${!KEY_ORDER[@]}"; do
-            local key="${KEY_ORDER[$i]}"
+        for i in "${!todo[@]}"; do
+            local key="${todo[$i]}"
             local gpu_id=$(( i % NUM_GPUS ))
             ( run_eval_job "${key}" "${gpu_id}" ) &
             pids+=("$!")
             echo "    [spawn] ${key} → GPU${gpu_id} (pid=$!)"
-            sleep 5   # 错开初始化
+            sleep 5
         done
 
         local retry=()
         for i in "${!pids[@]}"; do
             if wait "${pids[$i]}"; then
-                ok "${KEY_ORDER[$i]} 完成"
+                ok "${todo[$i]} 完成"
             else
-                warn "${KEY_ORDER[$i]} 失败，将降级重试"
-                retry+=("${KEY_ORDER[$i]}")
+                warn "${todo[$i]} 失败，将降级重试"
+                retry+=("${todo[$i]}")
             fi
         done
 
@@ -459,8 +483,8 @@ step5_evaluate() {
         fi
     else
         info "模式: serial (逐个跑)"
-        for i in "${!KEY_ORDER[@]}"; do
-            local key="${KEY_ORDER[$i]}"
+        for i in "${!todo[@]}"; do
+            local key="${todo[$i]}"
             local gpu_id=$(( i % NUM_GPUS ))
             if run_eval_job "${key}" "${gpu_id}"; then
                 ok "${key} 完成"
