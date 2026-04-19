@@ -159,9 +159,10 @@ step1_install() {
     pip install -e submodules/diff-gaussian-rasterization --no-build-isolation 2>&1 | tail -10 || \
         { err "diff-gaussian-rasterization 编译失败（评测必需）"; return 1; }
 
-    # 验证关键扩展能 import
-    python3 -c "import diff_gaussian_rasterization; print('  [ok] diff_gaussian_rasterization import 成功')" || \
-        { err "diff-gaussian-rasterization import 失败"; return 1; }
+    # 验证关键扩展能 import。注意：ranrhuang/diff-gaussian-rasterization 的 camera 分支
+    # 把包名改成了 diff_gauss_camera（src/model/decoder/cuda_splatting.py 也是这么 import 的）
+    python3 -c "import diff_gauss_camera; print('  [ok] diff_gauss_camera import 成功')" || \
+        { err "diff_gauss_camera import 失败"; return 1; }
 
     pip install -q "huggingface_hub[cli,hf_transfer]" colorama
     ok "依赖安装完成"
