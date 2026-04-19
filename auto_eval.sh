@@ -344,13 +344,19 @@ step4_sanity() {
     rm -rf "${out_path}"
     mkdir -p "${out_path}"
 
-    info "跑 sanity（只评 1 个 batch，约 30s）..."
+    # 首次启动包括：torch/hydra/jaxtyping imports、模型构建、ckpt 反序列化（4.6GB）、
+    # DataLoader worker fork、读取 index、拉取第一个 scene 到显存。
+    # H100 + byted-torch 2.7 首次加载经验 5-10 分钟很正常，给 20 分钟上限。
+    local SANITY_TIMEOUT="${SANITY_TIMEOUT:-1200}"
+    info "跑 sanity（1 个 batch，timeout=${SANITY_TIMEOUT}s；首次启动含 ckpt 加载 + DataLoader 冷启，较慢属正常）..."
+    info "  可另开 terminal 监控: tail -f ${out_path}/sanity.log"
+
     local logfile="${out_path}/sanity.log"
     local DATA_PARENT
     DATA_PARENT="$(dirname "${DATA_DIR}")"
 
     CUDA_VISIBLE_DEVICES=0 \
-    timeout 300 python3 -m src.main \
+    timeout "${SANITY_TIMEOUT}" python3 -m src.main \
         +experiment=nas3r/random/re10k \
         mode=test \
         wandb.mode=disabled \
@@ -363,22 +369,40 @@ step4_sanity() {
         test.compute_scores=true \
         test.output_path="${out_path}" \
         +trainer.limit_test_batches=1 \
+        data_loader.test.num_workers=0 \
         >"${logfile}" 2>&1
     local rc=$?
-    if [[ ${rc} -ne 0 ]]; then
-        err "Sanity check 失败（rc=${rc}），下面是日志末尾 50 行："
+
+    if [[ ${rc} -eq 0 ]]; then
+        ok "Sanity check 通过"
+        rm -rf "${out_path}"
+        return 0
+    fi
+
+    # rc=124 是 GNU timeout 的超时码
+    if [[ ${rc} -eq 124 ]]; then
+        warn "Sanity check 超时（${SANITY_TIMEOUT}s），但不一定是真错误"
+        warn "  日志最后几行（看卡在哪）："
         echo "------------------------------------------------"
-        tail -n 50 "${logfile}"
+        tail -n 20 "${logfile}"
         echo "------------------------------------------------"
-        err "请先根据上述错误修复环境，再重跑。"
-        err "常见问题："
-        err "  1. diff-gaussian-rasterization 没编译 → 手动: pip install -e submodules/diff-gaussian-rasterization --no-build-isolation"
-        err "  2. 数据位置不对 → 检查 ls ${DATA_DIR}/test/*.torch | head"
-        err "  3. torch/cuda 版本不匹配 → python -c 'import torch; print(torch.version.cuda)'"
+        warn "如果日志显示在 'Loading' 或 'Initializing'，只是太慢；"
+        warn "可以设置 SKIP_SANITY=1 直接进入正式评测（正式评测不带 timeout）"
+        warn "或增大 SANITY_TIMEOUT=3600 重试"
+        err "sanity 超时，中止。提示：SKIP_SANITY=1 bash $0 可跳过此步"
         return 1
     fi
-    ok "Sanity check 通过"
-    rm -rf "${out_path}"
+
+    err "Sanity check 失败（rc=${rc}），日志末尾 80 行："
+    echo "------------------------------------------------"
+    tail -n 80 "${logfile}"
+    echo "------------------------------------------------"
+    err "常见问题排查："
+    err "  1. diff_gauss_camera import 不成功 → python3 -c 'import diff_gauss_camera'"
+    err "  2. 数据位置不对 → ls ${DATA_DIR}/test/*.torch | head -3"
+    err "  3. cuda 版本不匹配 → python3 -c 'import torch; print(torch.version.cuda)'"
+    err "  4. OOM / 被 OS 杀 → dmesg | tail -30"
+    return 1
 }
 
 # ============================ Step 5+6: 评测（并行+重试+串行降级）============================
