@@ -120,18 +120,22 @@ if [[ "${DAEMON}" == "1" && -z "${NAS3R_DAEMON_CHILD:-}" ]]; then
     exit 0
 fi
 
-# ============================ CUDA / HF / wandb 环境 ============================
-export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"    # H100
+# ============================ 应用层环境变量（仅 Hydra/Python/HF）============================
+# 注意：
+#   * 平台级变量（ARNOLD_*, BYTED_TORCH_*, NCCL_DEBUG, NCCL_IB_* 等）应由 Arnold/Merlin 任务
+#     提交页面的 "环境变量" (JSON) 字段预设，不在此 bash 中重复导出，以免被平台默认值覆盖。
+#   * 下列 5 个变量是应用侧专属（Hydra / HuggingFace / Python 输出行为），平台不会管，这里必须设。
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"   # H100 sm_90（编译 pytorch3d/diff_gauss_camera 用）
 export FORCE_CUDA=1
 export MAX_JOBS="${MAX_JOBS:-8}"
-export HF_HUB_ENABLE_HF_TRANSFER=1
+export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 export HYDRA_FULL_ERROR=1
 export TOKENIZERS_PARALLELISM=false
-export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export PYTHONUNBUFFERED=1
-# 内存碎片优化（H100 + 大 batch 常用）
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 以下由平台（Arnold）预设；若未设置，脚本这里给一个合理默认，避免缺失
+: "${NCCL_DEBUG:=WARN}"; export NCCL_DEBUG
+: "${NCCL_ASYNC_ERROR_HANDLING:=1}"; export NCCL_ASYNC_ERROR_HANDLING
+: "${PYTORCH_CUDA_ALLOC_CONF:=expandable_segments:True}"; export PYTORCH_CUDA_ALLOC_CONF
 
 # wandb key
 if [[ -z "${WANDB_API_KEY:-}" && -f "${HOME}/.netrc" ]]; then
@@ -161,6 +165,11 @@ info "  ckpt_dir:        ${CKPT_DIR}"
 info "  work_dir:        ${WORK_DIR}"
 info "  wandb_mode:      ${WANDB_MODE}"
 info "  resume:          ${RESUME}"
+
+# 打印平台下发的关键环境变量（Arnold/Merlin/BYTED_TORCH 等），便于溯源
+log "平台环境变量快照（来自 Arnold 任务配置）"
+env | grep -E '^(ARNOLD_|BYTED_|NCCL_|NVIDIA_|MLP_|METIS_|CUDA_VISIBLE_DEVICES|PYTORCH_CUDA_ALLOC_CONF)=' \
+    | sort | sed 's/^/    /' | tee -a "${MAIN_LOG}"
 
 # ============================ Step 0: 代码仓库 ============================
 log "Step 0: 准备代码仓库"
