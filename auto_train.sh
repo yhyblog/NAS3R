@@ -389,9 +389,16 @@ step4_train() {
     local out_path="${OUT_ROOT}/${WANDB_NAME}"
     mkdir -p "${out_path}"
 
+    # 防崩 checkpoint 策略（可通过环境变量覆盖）
+    local CKPT_EVERY="${CKPT_EVERY:-500}"   # 每 500 step 存一次
+    local CKPT_KEEP="${CKPT_KEEP:-3}"       # 保留最新 3 份
+    local VAL_INTERVAL="${VAL_INTERVAL:-5000}"  # 降低 val 频率（原来 10000）
+
     info "配置：experiment=${EXPERIMENT} · ${NUM_GPUS}×GPU · batch_size=${BATCH_SIZE}/GPU · global_batch=$((NUM_GPUS * BATCH_SIZE))"
+    info "  checkpoint: 每 ${CKPT_EVERY} step 存一次, 保留最新 ${CKPT_KEEP} 份"
+    info "  validation: 每 ${VAL_INTERVAL} step 跑一次"
     info "  日志 → ${out_path}/train.log"
-    info "  checkpoints → outputs/exp_${WANDB_NAME}/checkpoints/"
+    info "  checkpoints → ${WORK_DIR}/outputs/exp_${WANDB_NAME}/checkpoints/"
 
     cd "${WORK_DIR}"
 
@@ -404,6 +411,11 @@ step4_train() {
             "dataset.re10k.roots=[${DATA_DIR}]" \
             data_loader.train.batch_size="${BATCH_SIZE}" \
             data_loader.train.num_workers="${NUM_WORKERS}" \
+            checkpointing.every_n_train_steps="${CKPT_EVERY}" \
+            checkpointing.save_top_k="${CKPT_KEEP}" \
+            checkpointing.save_weights_only=false \
+            checkpointing.resume=true \
+            trainer.val_check_interval="${VAL_INTERVAL}" \
             2>&1 | tee "${out_path}/train.log"
     else
         python3 -m src.main \
@@ -413,6 +425,11 @@ step4_train() {
             "dataset.re10k.roots=[${DATA_DIR}]" \
             data_loader.train.batch_size="${BATCH_SIZE}" \
             data_loader.train.num_workers="${NUM_WORKERS}" \
+            checkpointing.every_n_train_steps="${CKPT_EVERY}" \
+            checkpointing.save_top_k="${CKPT_KEEP}" \
+            checkpointing.save_weights_only=false \
+            checkpointing.resume=true \
+            trainer.val_check_interval="${VAL_INTERVAL}" \
             2>&1 | tee "${out_path}/train.log"
     fi
 
