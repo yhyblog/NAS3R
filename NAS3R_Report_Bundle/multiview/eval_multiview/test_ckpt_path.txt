@@ -1,0 +1,1 @@
+/opt/tiger/mmfinetune/nas3r/checkpoints/re10k_nas3r_multiview.ckpt
