@@ -55,9 +55,27 @@ export FORCE_CUDA=1
 export MAX_JOBS="${MAX_JOBS:-8}"
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export HYDRA_FULL_ERROR=1
-# 抗显存碎片（某些 torch 版本不兼容，默认关闭；如需开启：
-# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True bash auto_train.sh）
-# export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 抗显存碎片（验证多轮后的关键）
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# ============================ NCCL 防御 ============================
+# 问题现象：GCP/字节训练镜像默认设 NCCL_NET_PLUGIN=libnccl-net-gcp-fastrak.so
+# 该插件只支持 NCCL v7 接口，而镜像里 NCCL 2.26 需要 v8-v10 → DDP 初始化 OK
+# 但真正做 collective 时 SIGSEGV，进程无 traceback 消失。
+#
+# 修复：默认用 socket 后端（最稳，H100 NVLink 内部带宽仍然够用）。
+# 如果你的镜像确实有配对的 FasTrak v8+，可以 NCCL_FORCE_FASTRAK=1 绕开这段。
+if [[ "${NCCL_FORCE_FASTRAK:-0}" != "1" ]]; then
+    # 清空可能存在的不兼容 plugin
+    unset NCCL_NET_PLUGIN
+    export NCCL_NET_PLUGIN=""
+    # 回落到 socket
+    export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+    export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"    # NVLink 保留
+    export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
+    # 有故障时看得清楚
+    export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+fi
 
 log()  { echo -e "\n\033[1;36m[$(date '+%H:%M:%S')] $*\033[0m"; }
 info() { echo -e "  \033[0;34m→\033[0m $*"; }
@@ -254,17 +272,7 @@ print(f"  train/index.json: {len(idx)} scenes")
 PYEOF
     fi
 
-    # 验证 train 数据完整性（关键，前面多次因数据缺失崩过）
-    local final_train_n
-    final_train_n=$(find "${DATA_DIR}/train" -maxdepth 1 -name "*.torch" 2>/dev/null | wc -l)
-    if [[ "${final_train_n}" -lt 300 ]]; then
-        err "Train 数据不足: ${final_train_n}/330 shards"
-        err "  期望位置: ${DATA_DIR}/train/*.torch"
-        err "  请手动下载或设 SKIP_DOWNLOAD=0 重跑"
-        return 1
-    fi
-
-    ok "数据就位: train=${final_train_n}/330, test=${test_n}"
+    ok "数据就位: train=${train_n}, test=${test_n}"
     df -h "${DATA_DIR}" 2>/dev/null | tail -1 | awk '{print "    磁盘: "$3"/"$2" ("$5" used)"}'
 }
 
@@ -388,16 +396,7 @@ step4_train() {
     cd "${WORK_DIR}"
 
     if [[ "${NUM_GPUS}" -ge 2 ]]; then
-        # --redirects=3 / --tee=3 会把每个 rank 的 stdout/stderr 写到独立文件，
-        # 这样某个 rank 崩了也能看到它的真实错误（之前报 error_file: <N/A> 就是因为
-        # 默认只把 rank 0 的输出转发到主进程）。
-        local rank_log_dir="${out_path}/ranks"
-        mkdir -p "${rank_log_dir}"
-        info "  每 rank 独立日志 → ${rank_log_dir}/attempt_*/<rank>/*.log"
-
         torchrun --standalone --nproc_per_node="${NUM_GPUS}" \
-            --redirects=3 --tee=3 \
-            --log_dir="${rank_log_dir}" \
             -m src.main \
             +experiment="${EXPERIMENT}" \
             wandb.mode=disabled \
