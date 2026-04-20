@@ -85,6 +85,28 @@ warn() { echo -e "  \033[1;33m⚠\033[0m $*"; }
 err()  { echo -e "\033[1;31m✗ ERROR: $*\033[0m" >&2; }
 
 # ============================ Step 0: 代码仓库 ============================
+# 校验 ${WORK_DIR} 里 git remote 'origin' 指向的是不是我们期望的 REPO_URL。
+# 如果 URL 对不上（比如这台机器 cd 进去的是公司的 mmfinetune 仓库），
+# 会删掉并重新 clone，避免把 mmfinetune 的 master 当成 NAS3R 来 pull。
+ensure_correct_remote() {
+    local dir="$1"
+    [[ -d "${dir}/.git" ]] || return 1
+    local actual
+    actual=$(git -C "${dir}" config --get remote.origin.url 2>/dev/null)
+    # 允许 .git 结尾差异、ghproxy 前缀差异
+    local expect_base
+    expect_base=$(echo "${REPO_URL}" | sed -E 's#^https?://(ghproxy\.com/)?(github\.com/[^.]+).*#\2#')
+    local actual_base
+    actual_base=$(echo "${actual}" | sed -E 's#^https?://(ghproxy\.com/)?(github\.com/[^.]+).*#\2#; s#^git@github\.com:#github.com/#; s#\.git$##')
+    if [[ "${actual_base}" == "${expect_base}" ]]; then
+        return 0
+    fi
+    warn "${dir} 的 origin 不是期望仓库:"
+    warn "  期望: ${REPO_URL}"
+    warn "  实际: ${actual}"
+    return 1
+}
+
 step0_code() {
     log "Step 0: 准备代码仓库 → ${WORK_DIR}"
     mkdir -p "${PARENT_DIR}"
@@ -95,33 +117,63 @@ step0_code() {
 
     cd "${PARENT_DIR}"
 
-    if [[ "${SKIP_CLONE}" == "1" ]]; then
-        info "SKIP_CLONE=1，跳过"
-        [[ -d "${WORK_DIR}/.git" ]] || { err "${WORK_DIR} 不是 git 仓库"; return 1; }
-    elif [[ -d "${WORK_DIR}/.git" ]]; then
-        info "仓库已存在，git pull"
-        cd "${WORK_DIR}"
-        git fetch origin "${REPO_BRANCH}" >/dev/null 2>&1 || true
-        git checkout "${REPO_BRANCH}" >/dev/null 2>&1 || true
-        git pull --ff-only origin "${REPO_BRANCH}" 2>&1 | tail -3 || \
-            warn "git pull 失败，继续用当前版本"
-    elif [[ -d "${WORK_DIR}" ]]; then
-        warn "${WORK_DIR} 存在但不是 git 仓库，清空后重新 clone"
+    # 1) FORCE_FRESH_CLONE=1 → 无条件删除重 clone
+    if [[ "${FORCE_FRESH_CLONE:-0}" == "1" && -d "${WORK_DIR}" ]]; then
+        warn "FORCE_FRESH_CLONE=1，强制删除 ${WORK_DIR} 重新 clone"
         rm -rf "${WORK_DIR}"
-        git clone --recurse-submodules -b "${REPO_BRANCH}" "${REPO_URL}" "${REPO_NAME}" || \
-            { err "clone 失败"; return 1; }
+    fi
+
+    # 2) SKIP_CLONE=1 → 假设代码已就位，只校验
+    if [[ "${SKIP_CLONE}" == "1" ]]; then
+        info "SKIP_CLONE=1，跳过 clone/pull"
+        [[ -d "${WORK_DIR}/.git" ]] || { err "${WORK_DIR} 不是 git 仓库"; return 1; }
     else
-        info "clone ${REPO_URL}"
-        git clone --recurse-submodules -b "${REPO_BRANCH}" "${REPO_URL}" "${REPO_NAME}" || \
-            { err "clone 失败"; return 1; }
+        # 3) 已存在 .git → 校验 remote 对不对，对则 pull，不对则重 clone
+        if [[ -d "${WORK_DIR}/.git" ]]; then
+            if ensure_correct_remote "${WORK_DIR}"; then
+                info "仓库已存在且 remote 正确，git pull ..."
+                cd "${WORK_DIR}"
+                git fetch origin "${REPO_BRANCH}" 2>&1 | tail -3 || warn "git fetch 失败"
+                git checkout "${REPO_BRANCH}" 2>&1 | tail -3 || warn "git checkout 失败"
+                if ! git pull --ff-only origin "${REPO_BRANCH}" 2>&1 | tail -3; then
+                    warn "ff-only pull 失败（本地有改动？），尝试 reset --hard origin/${REPO_BRANCH}"
+                    if [[ "${AUTO_RESET:-1}" == "1" ]]; then
+                        git fetch origin "${REPO_BRANCH}"
+                        git reset --hard "origin/${REPO_BRANCH}" 2>&1 | tail -3
+                    else
+                        warn "保留本地改动（AUTO_RESET=0），继续用当前版本"
+                    fi
+                fi
+                cd "${PARENT_DIR}"
+            else
+                warn "remote 不匹配，删掉旧目录重新 clone"
+                rm -rf "${WORK_DIR}"
+            fi
+        # 4) 目录存在但不是 git 仓库 → 删掉重 clone
+        elif [[ -d "${WORK_DIR}" ]]; then
+            warn "${WORK_DIR} 存在但不是 git 仓库，清空后重新 clone"
+            rm -rf "${WORK_DIR}"
+        fi
+
+        # 5) 此时若不存在则 clone
+        if [[ ! -d "${WORK_DIR}/.git" ]]; then
+            info "clone ${REPO_URL} (branch=${REPO_BRANCH})"
+            git clone --recurse-submodules -b "${REPO_BRANCH}" "${REPO_URL}" "${REPO_NAME}" \
+                2>&1 | tail -5 || { err "clone 失败"; return 1; }
+        fi
     fi
 
     [[ -d "${WORK_DIR}/.git" && -f "${WORK_DIR}/src/main.py" ]] || {
         err "代码不完整: ${WORK_DIR}"
+        err "  .git 存在? $([[ -d ${WORK_DIR}/.git ]] && echo yes || echo no)"
+        err "  src/main.py 存在? $([[ -f ${WORK_DIR}/src/main.py ]] && echo yes || echo no)"
         return 1
     }
 
     cd "${WORK_DIR}"
+    info "当前仓库: $(git config --get remote.origin.url)"
+    info "当前分支: $(git rev-parse --abbrev-ref HEAD)"
+    info "当前 commit: $(git log -1 --format='%h %s' | cut -c1-80)"
 
     # submodule 兜底
     git submodule sync --recursive >/dev/null 2>&1 || true
