@@ -1,1 +1,0 @@
-checkpoints/re10k_nas3r.ckpt

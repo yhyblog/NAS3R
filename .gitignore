@@ -24,3 +24,19 @@ build/
 outputs/
 wandb/
 assets/evaluation_index_re10k.subset.json
+
+# 评测报告本地打包（大文件 + 个人中间产物，不应进 git）
+NAS3R_Report_Bundle/
+NAS3R_Report_Bundle.tar.gz
+NAS3R_Report_Bundle.zip
+summary.md
+summary*.md
+summary*.json
+NAS3R_Evaluation_Report.md
+
+# 本地日志
+日志*.log
+报错日志*.log
+
+# IDE 副本
+auto_train*(*).sh
