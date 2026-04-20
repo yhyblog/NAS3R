@@ -19,9 +19,41 @@ def compute_psnr(
     return -10 * mse.log10()
 
 
+# -----------------------------------------------------------------------------
+# LPIPS 单例（fix OOM around step 10000–20000）
+# -----------------------------------------------------------------------------
+# Bug: 原实现在训练时已经有一份 LPIPS（src/loss/loss_lpips.py 里作为 buffer 放到
+# 模型上），每次 validation 再通过 @cache 的 get_lpips(device) 又创建一份
+# ~528MB 的 VGG-LPIPS 永久驻留 GPU。每个 DDP rank 都会独立缓存，叠加 activation
+# 峰值就容易把 80GB 显存打爆 —— 时间线与 val_check_interval=10000 吻合。
+#
+# Fix:
+#   1. 暴露 set_lpips_module(...) 接口，允许外部（ModelWrapper）把训练 loss 的
+#      LPIPS 实例注册进来；compute_lpips 优先用该实例，零额外显存。
+#   2. 若未注册则回退到旧逻辑（保持向后兼容）。
+# -----------------------------------------------------------------------------
+
+_LPIPS_SHARED: "LPIPS | None" = None
+
+
+def set_lpips_module(lpips: "LPIPS | None") -> None:
+    """让 ModelWrapper 在 __init__ 里把 losses 中现成的 LPIPS 注入进来。"""
+    global _LPIPS_SHARED
+    _LPIPS_SHARED = lpips
+
+
 @cache
-def get_lpips(device: torch.device) -> LPIPS:
+def _get_lpips_fallback(device: torch.device) -> LPIPS:
+    """兜底：外部未注册时仍能工作。缓存一份避免反复创建。"""
     return LPIPS(net="vgg").to(device)
+
+
+def get_lpips(device: torch.device) -> LPIPS:
+    """返回 LPIPS 实例；优先用外部共享的那份（省 ~528MB/rank）。"""
+    if _LPIPS_SHARED is not None:
+        # 确保和当前评估张量同设备。buffer 模式下 .to(device) 是 no-op 如果已在同设备。
+        return _LPIPS_SHARED.to(device)
+    return _get_lpips_fallback(device)
 
 
 @torch.no_grad()

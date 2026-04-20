@@ -165,6 +165,17 @@ class ModelWrapper(LightningModule):
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
 
+        # OOM fix: share the LPIPS VGG backbone with evaluation/metrics.compute_lpips
+        # so validation does not instantiate a second ~528MB copy per rank
+        # (which previously blew up memory around step 10000 when val fires).
+        from ..evaluation import metrics as _eval_metrics
+        _shared_lpips = None
+        for _loss in self.losses:
+            if getattr(_loss, "name", None) == "lpips" and hasattr(_loss, "lpips"):
+                _shared_lpips = _loss.lpips
+                break
+        _eval_metrics.set_lpips_module(_shared_lpips)
+
         self.distiller = distiller
         self.distiller_loss = None
         if self.distiller is not None:
@@ -727,6 +738,16 @@ class ModelWrapper(LightningModule):
             self.render_video_wobble(batch)
             self.render_video_interpolation_exaggerated(batch)
 
+
+    def on_validation_epoch_end(self) -> None:
+        # OOM fix: explicitly release cached activations / temp tensors after
+        # each validation pass to avoid fragmentation growth across repeated
+        # train↔val transitions (which previously correlated with OOM crashes
+        # around step 10000–20000).
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @rank_zero_only
     def render_video_wobble(self, batch: BatchedExample) -> None:
