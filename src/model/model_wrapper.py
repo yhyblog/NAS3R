@@ -599,8 +599,34 @@ class ModelWrapper(LightningModule):
                         print(f"Pose AUC {method} {overlap_tag} of {item}: ", auc, " median error", median_error)
 
 
-    @rank_zero_only
+    # NOTE(fix NCCL hang around step 20000): The original implementation had
+    # @rank_zero_only on validation_step, which means only rank 0 entered the
+    # function and ran self.encoder(...) forward. Under DDP this is a reliable
+    # way to deadlock: the next training step's forward on rank 0 had already
+    # queued collective ops that ranks 1..7 never reached, so the watchdog
+    # eventually timed out after 30 min with SeqNum=2946348 AllReduce stuck.
+    #
+    # Fix: let ALL ranks enter validation_step, but only rank 0 does the
+    # actual work. Non-zero ranks return immediately. On rank 0 we wrap the
+    # forward in the DDP module's no_sync() context so no allreduce hooks are
+    # triggered (they would be a no-op anyway since we're in eval mode, but
+    # this is a safety net).
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        if self.global_rank != 0:
+            return
+
+        # If we're wrapped in DDP, use no_sync() to suppress any collective ops.
+        trainer = getattr(self, "trainer", None)
+        strategy = getattr(trainer, "strategy", None) if trainer is not None else None
+        ddp_model = getattr(strategy, "model", None) if strategy is not None else None
+
+        if ddp_model is not None and hasattr(ddp_model, "no_sync"):
+            with ddp_model.no_sync():
+                return self._validation_step_impl(batch, batch_idx, dataloader_idx)
+        return self._validation_step_impl(batch, batch_idx, dataloader_idx)
+
+    @torch.no_grad()
+    def _validation_step_impl(self, batch, batch_idx, dataloader_idx=0):
          # Render Gaussians.
         if self.train_cfg.random_drop_context_views:
             v_cxt = batch["context"]["image"].shape[1]

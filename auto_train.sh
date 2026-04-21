@@ -393,6 +393,11 @@ step4_train() {
     local CKPT_EVERY="${CKPT_EVERY:-500}"   # 每 500 step 存一次
     local CKPT_KEEP="${CKPT_KEEP:-3}"       # 保留最新 3 份
     local VAL_INTERVAL="${VAL_INTERVAL:-5000}"  # 降低 val 频率（原来 10000）
+    # 设 DISABLE_VAL=1 可以完全关掉 validation，用于快速抢救。
+    if [[ "${DISABLE_VAL:-0}" == "1" ]]; then
+        VAL_INTERVAL=999999999
+        warn "DISABLE_VAL=1: 本次训练跳过所有 validation（只跑 train + 存 ckpt）"
+    fi
 
     info "配置：experiment=${EXPERIMENT} · ${NUM_GPUS}×GPU · batch_size=${BATCH_SIZE}/GPU · global_batch=$((NUM_GPUS * BATCH_SIZE))"
     info "  checkpoint: 每 ${CKPT_EVERY} step 存一次, 保留最新 ${CKPT_KEEP} 份"
