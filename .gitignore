@@ -24,3 +24,17 @@ build/
 outputs/
 wandb/
 assets/evaluation_index_re10k.subset.json
+
+# 本地打包/中间产物（不上 git，只保留 NAS3R_Evaluation_Report.md 这一个入口）
+NAS3R_Report_Bundle/
+NAS3R_Report_Bundle.tar.gz
+NAS3R_Report_Bundle.zip
+summary.md
+summary.json
+summary*(*).md
+summary*(*).json
+
+# IDE 自动生成的重名副本（如 "auto_train (1).sh"、"summary (1).md"）
+*\ \(*\).sh
+*\ \(*\).md
+*\ \(*\).json
