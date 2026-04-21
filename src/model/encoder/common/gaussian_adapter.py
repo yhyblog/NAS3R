@@ -103,10 +103,8 @@ class GaussianAdapter(nn.Module):
         pixel_size: Float[Tensor, "*#batch 2"],
         multiplier: float = 0.1,
     ) -> Float[Tensor, " *batch"]:
-        # Force FP32 for matrix inverse (no BF16/FP16 CUDA kernel for linalg.inv).
-        intrinsics_inv = intrinsics[..., :2, :2].float().inverse().to(intrinsics.dtype)
         xy_multipliers = multiplier * einsum(
-            intrinsics_inv,
+            intrinsics[..., :2, :2].inverse(),
             pixel_size,
             "... i j, j -> ... i",
         )

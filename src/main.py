@@ -137,17 +137,6 @@ def train(cfg_dict: DictConfig):
     # This allows the current step to be shared with the data loader processes.
     step_tracker = StepTracker()
 
-    # Speed: enable TF32 on Ampere/Hopper matmuls (safe for forward/backward FP32 training).
-    # On H100 this alone gives ~1.5x without any precision loss in practice.
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-
-    # Optional mixed precision: set +trainer.precision=bf16-mixed (or 16-mixed / 32).
-    # BF16 on H100 doubles throughput vs FP32 and halves activation memory.
-    _precision = cfg_dict.trainer.get("precision", "32-true") if hasattr(cfg_dict.trainer, "get") \
-        else getattr(cfg_dict.trainer, "precision", "32-true")
-
     trainer = Trainer(
         max_epochs=-1,
         num_nodes=cfg.trainer.num_nodes,
@@ -165,7 +154,6 @@ def train(cfg_dict: DictConfig):
         enable_progress_bar=False,
         gradient_clip_val=cfg.trainer.gradient_clip_val,
         max_steps=cfg.trainer.max_steps,
-        precision=_precision,
         # plugins=[SLURMEnvironment(requeue_signal=signal.SIGUSR1)],  # Uncomment for SLURM auto resubmission.
         inference_mode=False if (cfg.mode == "test" and cfg.test.align_pose) else True,
     )

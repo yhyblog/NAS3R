@@ -49,32 +49,23 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         depth_mode: DepthRenderingMode | None = None,
     ) -> DecoderOutput:
         b, v, _, _ = extrinsics.shape
-
-        # BF16/FP16 compat: disable autocast for the entire rendering path.
-        # Rationale:
-        #   - torch.linalg.inv has no BF16/FP16 CUDA kernel (camera extrinsics inversion)
-        #   - Gaussian Splatting rasterizer kernels expect FP32 inputs
-        #   - Pose math is numerically sensitive, mixed-precision is risky here.
-        # The Transformer backbone (encoder) still runs in BF16 under autocast;
-        # only this decoder block is forced to FP32.
-        with torch.autocast(device_type="cuda", enabled=False):
-            color, depth = render_cuda(
-                rearrange(extrinsics, "b v i j -> (b v) i j").float(),
-                rearrange(intrinsics, "b v i j -> (b v) i j").float(),
-                rearrange(near, "b v -> (b v)").float(),
-                rearrange(far, "b v -> (b v)").float(),
-                image_shape,
-                repeat(self.background_color, "c -> (b v) c", b=b, v=v).float(),
-                repeat(gaussians.means, "b g xyz -> (b v) g xyz", v=v).float(),
-                repeat(gaussians.covariances, "b g i j -> (b v) g i j", v=v).float(),
-                repeat(gaussians.harmonics, "b g c d_sh -> (b v) g c d_sh", v=v).float(),
-                repeat(gaussians.opacities, "b g -> (b v) g", v=v).float(),
-                repeat(gaussians.rotations, "b g i -> (b v) g i", v=v).float(),
-                repeat(gaussians.scales, "b g i -> (b v) g i", v=v).float(),
-                scale_invariant=self.make_scale_invariant,
-                enable_cov_grad=self.enable_cov_grad,
-                enable_sh_grad=self.enable_sh_grad
-            )
+        color, depth = render_cuda(
+            rearrange(extrinsics, "b v i j -> (b v) i j"),
+            rearrange(intrinsics, "b v i j -> (b v) i j"),
+            rearrange(near, "b v -> (b v)"),
+            rearrange(far, "b v -> (b v)"),
+            image_shape,
+            repeat(self.background_color, "c -> (b v) c", b=b, v=v),
+            repeat(gaussians.means, "b g xyz -> (b v) g xyz", v=v),
+            repeat(gaussians.covariances, "b g i j -> (b v) g i j", v=v),
+            repeat(gaussians.harmonics, "b g c d_sh -> (b v) g c d_sh", v=v),
+            repeat(gaussians.opacities, "b g -> (b v) g", v=v),
+            repeat(gaussians.rotations, "b g i -> (b v) g i", v=v),
+            repeat(gaussians.scales, "b g i -> (b v) g i", v=v),
+            scale_invariant=self.make_scale_invariant,
+            enable_cov_grad=self.enable_cov_grad,
+            enable_sh_grad=self.enable_sh_grad
+        )
         color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
 
         

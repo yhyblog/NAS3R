@@ -41,9 +41,7 @@ def transform_world2cam(
     extrinsics: Float[Tensor, "*#batch dim dim"],
 ) -> Float[Tensor, "*batch dim"]:
     """Transform points from 3D world coordinates to 3D camera coordinates."""
-    # BF16/FP16: force FP32 for matrix inverse (no low-precision CUDA kernel).
-    inv = extrinsics.float().inverse().to(extrinsics.dtype)
-    return transform_rigid(homogeneous_coordinates, inv)
+    return transform_rigid(homogeneous_coordinates, extrinsics.inverse())
 
 
 def project_camera_space(
@@ -85,10 +83,8 @@ def unproject(
     coordinates = homogenize_points(coordinates) # (b, v, h, w, 3)
     # print("coordinates", coordinates.shape, coordinates)
     # print("z", z.shape) # (b, v, h, w)
-    # BF16/FP16: force FP32 for intrinsics inverse.
-    intrinsics_inv = intrinsics.float().inverse().to(intrinsics.dtype)
     ray_directions = einsum(
-        intrinsics_inv, coordinates, "... i j, ... j -> ... i"
+        intrinsics.inverse(), coordinates, "... i j, ... j -> ... i"
     )
 
     # print("ray_directions", ray_directions.shape, ray_directions)
@@ -272,8 +268,7 @@ def intersect_rays(
 
 
 def get_fov(intrinsics: Float[Tensor, "batch 3 3"]) -> Float[Tensor, "batch 2"]:
-    # BF16/FP16: force FP32 for matrix inverse.
-    intrinsics_inv = intrinsics.float().inverse().to(intrinsics.dtype)
+    intrinsics_inv = intrinsics.inverse()
 
     def process_vector(vector):
         vector = torch.tensor(vector, dtype=torch.float32, device=intrinsics.device)
