@@ -707,21 +707,27 @@ class ModelWrapper(LightningModule):
         rgb_pred = output.color[0]
         depth_pred = vis_depth_map(output.depth[0])
 
-        # Target view metrics
+        # Target view metrics.  NOTE: we pass rank_zero_only=True to every
+        # self.log inside validation to prevent Lightning from registering a
+        # metric accumulator that would later require an allreduce at
+        # on_validation_epoch_end. Without this, rank 0 has the accumulator
+        # but ranks 1..7 (which early-returned from validation_step) do not,
+        # which causes a 30-min NCCL ALLREDUCE hang -> watchdog timeout.
+        _log_kw = dict(rank_zero_only=True, sync_dist=False, on_step=False, on_epoch=True)
         psnr = compute_psnr(rgb_gt[v_cxt:], rgb_pred[v_cxt:]).mean()
-        self.log(f"val/psnr", psnr)
+        self.log(f"val/psnr", psnr, **_log_kw)
         lpips = compute_lpips(rgb_gt[v_cxt:], rgb_pred[v_cxt:]).mean()
-        self.log(f"val/lpips", lpips)
+        self.log(f"val/lpips", lpips, **_log_kw)
         ssim_val = compute_ssim(rgb_gt[v_cxt:], rgb_pred[v_cxt:]).mean()
-        self.log(f"val/ssim", ssim_val)
+        self.log(f"val/ssim", ssim_val, **_log_kw)
 
         # Context view metrics
         psnr = compute_psnr(rgb_gt[:v_cxt], rgb_pred[:v_cxt]).mean()
-        self.log(f"val/context/psnr", psnr)
+        self.log(f"val/context/psnr", psnr, **_log_kw)
         lpips = compute_lpips(rgb_gt[:v_cxt], rgb_pred[:v_cxt]).mean()
-        self.log(f"val/context/lpips", lpips)
+        self.log(f"val/context/lpips", lpips, **_log_kw)
         ssim_val = compute_ssim(rgb_gt[:v_cxt], rgb_pred[:v_cxt]).mean()
-        self.log(f"val/context/ssim", ssim_val)
+        self.log(f"val/context/ssim", ssim_val, **_log_kw)
 
         # Construct comparison image.
         context_img = batch["context"]["image"][0]
@@ -742,18 +748,23 @@ class ModelWrapper(LightningModule):
             context_rot_error, context_transl_error = compute_pose_error_for_batch(pred_extrinsics_cwt[:,v_cxt-1], batch["context"]["extrinsics"][:,v_cxt-1])
             target_rot_error, target_transl_error = compute_pose_error_for_batch(pred_extrinsics_cwt[:,v_cxt:], batch["target"]["extrinsics"])
 
-            self.log(f"val/context_angular_error", context_rot_error)
-            self.log(f"val/context_transl_error", context_transl_error)
-            self.log(f"val/target_angular_error", target_rot_error)
-            self.log(f"val/target_transl_error", target_transl_error)
+            self.log(f"val/context_angular_error", context_rot_error, **_log_kw)
+            self.log(f"val/context_transl_error", context_transl_error, **_log_kw)
+            self.log(f"val/target_angular_error", target_rot_error, **_log_kw)
+            self.log(f"val/target_transl_error", target_transl_error, **_log_kw)
 
 
-        self.logger.log_image(
-            "comparison",
-            [prep_image(add_border(comparison))],
-            step=self.global_step,
-            caption=batch["scene"],
-        )
+        # log_image can also try to sync, so guard with rank 0.
+        if self.global_rank == 0 and hasattr(self.logger, "log_image"):
+            try:
+                self.logger.log_image(
+                    "comparison",
+                    [prep_image(add_border(comparison))],
+                    step=self.global_step,
+                    caption=batch["scene"],
+                )
+            except Exception as e:
+                print(f"[val] log_image skipped: {e}")
 
        
         # Run video validation step.
