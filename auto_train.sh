@@ -399,6 +399,44 @@ step4_train() {
         warn "DISABLE_VAL=1: 本次训练跳过所有 validation（只跑 train + 存 ckpt）"
     fi
 
+    # ============================ 自动 resume ============================
+    # 这是之前踩过的坑：cfg.checkpointing.resume=true 本身 不 会 自动扫描
+    # checkpoints/，必须显式把 cfg.checkpointing.load 设成 ckpt 路径。
+    # 所以这里主动去找最新一份 .ckpt：优先找本次实验目录，否则兜底全局最新。
+    #
+    # 覆盖方式：
+    #   RESUME_CKPT=/path/to/foo.ckpt    手动指定
+    #   NO_RESUME=1                      禁用 resume（强制从头训）
+    local RESUME_ARG=()
+    if [[ "${NO_RESUME:-0}" == "1" ]]; then
+        warn "NO_RESUME=1: 从头开始训练（忽略已有 checkpoint）"
+    elif [[ -n "${RESUME_CKPT:-}" ]]; then
+        if [[ -f "${RESUME_CKPT}" ]]; then
+            info "从指定 ckpt resume: ${RESUME_CKPT}"
+            RESUME_ARG=( "checkpointing.load=${RESUME_CKPT}" )
+        else
+            err "RESUME_CKPT 不存在: ${RESUME_CKPT}"
+            return 1
+        fi
+    else
+        # 自动找：1) 本次 WANDB_NAME 对应的目录  2) outputs/exp_*/ 下全局最新
+        local latest_ckpt=""
+        # 先找本次实验目录（严格匹配）
+        latest_ckpt=$(find "${WORK_DIR}/outputs/exp_${WANDB_NAME}" -name "*.ckpt" 2>/dev/null | sort -V | tail -1)
+        # 没找到 → 找所有 exp_* 目录里最新的一个 ckpt
+        if [[ -z "${latest_ckpt}" ]]; then
+            latest_ckpt=$(find "${WORK_DIR}/outputs" -path "*/checkpoints/*.ckpt" -printf '%T@ %p\n' 2>/dev/null \
+                | sort -n | tail -1 | awk '{print $2}')
+        fi
+        if [[ -n "${latest_ckpt}" && -f "${latest_ckpt}" ]]; then
+            info "自动 resume 从最新 ckpt: ${latest_ckpt}"
+            info "  （设 NO_RESUME=1 可强制从头训；或 RESUME_CKPT=/path 指定其他 ckpt）"
+            RESUME_ARG=( "checkpointing.load=${latest_ckpt}" )
+        else
+            info "未找到已有 ckpt，从头开始训练"
+        fi
+    fi
+
     info "配置：experiment=${EXPERIMENT} · ${NUM_GPUS}×GPU · batch_size=${BATCH_SIZE}/GPU · global_batch=$((NUM_GPUS * BATCH_SIZE))"
     info "  checkpoint: 每 ${CKPT_EVERY} step 存一次, 保留最新 ${CKPT_KEEP} 份"
     info "  validation: 每 ${VAL_INTERVAL} step 跑一次"
@@ -421,6 +459,7 @@ step4_train() {
             checkpointing.save_weights_only=false \
             checkpointing.resume=true \
             trainer.val_check_interval="${VAL_INTERVAL}" \
+            "${RESUME_ARG[@]}" \
             2>&1 | tee "${out_path}/train.log"
     else
         python3 -m src.main \
@@ -435,6 +474,7 @@ step4_train() {
             checkpointing.save_weights_only=false \
             checkpointing.resume=true \
             trainer.val_check_interval="${VAL_INTERVAL}" \
+            "${RESUME_ARG[@]}" \
             2>&1 | tee "${out_path}/train.log"
     fi
 
