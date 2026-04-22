@@ -77,6 +77,26 @@ if [[ "${NCCL_FORCE_FASTRAK:-0}" != "1" ]]; then
     export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 fi
 
+# ============================ NCCL 偶发卡死对策 ============================
+# 现象：纯训练 DDP 跑 10-13 小时后偶发某个 AllReduce 不返回（NumelIn=2189907
+# 的梯度 bucket），8 个 rank 全卡在同一个 work id，1800s 超时后进程崩溃。
+# 这不是代码 bug，是字节/GCP 镜像里 NCCL 在 socket 后端上偶发的通信卡死。
+#
+# 对策：
+# 1) 打开 ASYNC_ERROR_HANDLING，让 collective 出错时立刻抛异常（而不是等 watchdog）
+# 2) 降低 HEARTBEAT_TIMEOUT：从默认 600s 降到 300s，卡 5 分钟就终止，尽快暴露
+# 3) TORCH_NCCL_BLOCKING_WAIT=0 + TORCH_NCCL_ASYNC_ERROR_HANDLING=1：非阻塞但能抛错
+# 4) flight recorder 开着，下次崩能抓到真正卡住的 collective 调用栈
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-0}"
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-300}"
+export TORCH_NCCL_TRACE_BUFFER_SIZE="${TORCH_NCCL_TRACE_BUFFER_SIZE:-20000}"
+# AllReduce 超时：从默认 1800s 降到 600s（10 分钟没响应就认定挂死）
+export NCCL_TIMEOUT="${NCCL_TIMEOUT:-600}"
+# 额外稳定性：关闭 NCCL socket 侧的 retry，出错就直接抛
+export NCCL_SOCKET_NTHREADS="${NCCL_SOCKET_NTHREADS:-4}"
+export NCCL_NSOCKS_PERTHREAD="${NCCL_NSOCKS_PERTHREAD:-2}"
+
 log()  { echo -e "\n\033[1;36m[$(date '+%H:%M:%S')] $*\033[0m"; }
 info() { echo -e "  \033[0;34m→\033[0m $*"; }
 ok()   { echo -e "  \033[1;32m✓\033[0m $*"; }
@@ -445,40 +465,104 @@ step4_train() {
 
     cd "${WORK_DIR}"
 
-    if [[ "${NUM_GPUS}" -ge 2 ]]; then
-        torchrun --standalone --nproc_per_node="${NUM_GPUS}" \
-            -m src.main \
-            +experiment="${EXPERIMENT}" \
-            wandb.mode=disabled \
-            wandb.name="${WANDB_NAME}" \
-            "dataset.re10k.roots=[${DATA_DIR}]" \
-            data_loader.train.batch_size="${BATCH_SIZE}" \
-            data_loader.train.num_workers="${NUM_WORKERS}" \
-            checkpointing.every_n_train_steps="${CKPT_EVERY}" \
-            checkpointing.save_top_k="${CKPT_KEEP}" \
-            checkpointing.save_weights_only=false \
-            checkpointing.resume=true \
-            trainer.val_check_interval="${VAL_INTERVAL}" \
-            "${RESUME_ARG[@]}" \
-            2>&1 | tee "${out_path}/train.log"
-    else
-        python3 -m src.main \
-            +experiment="${EXPERIMENT}" \
-            wandb.mode=disabled \
-            wandb.name="${WANDB_NAME}" \
-            "dataset.re10k.roots=[${DATA_DIR}]" \
-            data_loader.train.batch_size="${BATCH_SIZE}" \
-            data_loader.train.num_workers="${NUM_WORKERS}" \
-            checkpointing.every_n_train_steps="${CKPT_EVERY}" \
-            checkpointing.save_top_k="${CKPT_KEEP}" \
-            checkpointing.save_weights_only=false \
-            checkpointing.resume=true \
-            trainer.val_check_interval="${VAL_INTERVAL}" \
-            "${RESUME_ARG[@]}" \
-            2>&1 | tee "${out_path}/train.log"
-    fi
+    # ========== 自动重启循环 ==========
+    # 背景：NCCL 在长时间训练（10-13h）后偶发 AllReduce 卡死。既然是偶发的，
+    # 就接受它：每次崩溃后，自动找最新 ckpt，重启 torchrun，继续训练。
+    # 设 NO_AUTORESTART=1 可禁用（仅跑一次）。
+    local MAX_RESTARTS="${MAX_RESTARTS:-20}"
+    local attempt=0
+    local rc=0
+    local run_resume_arg=( "${RESUME_ARG[@]}" )
 
-    local rc=${PIPESTATUS[0]}
+    while true; do
+        attempt=$((attempt + 1))
+        info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        info "训练启动第 ${attempt} 次"
+        [[ ${#run_resume_arg[@]} -gt 0 ]] && info "  ${run_resume_arg[0]}"
+        info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        local per_run_log="${out_path}/train_attempt${attempt}.log"
+
+        if [[ "${NUM_GPUS}" -ge 2 ]]; then
+            torchrun --standalone --nproc_per_node="${NUM_GPUS}" \
+                -m src.main \
+                +experiment="${EXPERIMENT}" \
+                wandb.mode=disabled \
+                wandb.name="${WANDB_NAME}" \
+                "dataset.re10k.roots=[${DATA_DIR}]" \
+                data_loader.train.batch_size="${BATCH_SIZE}" \
+                data_loader.train.num_workers="${NUM_WORKERS}" \
+                checkpointing.every_n_train_steps="${CKPT_EVERY}" \
+                checkpointing.save_top_k="${CKPT_KEEP}" \
+                checkpointing.save_weights_only=false \
+                checkpointing.resume=true \
+                trainer.val_check_interval="${VAL_INTERVAL}" \
+                "${run_resume_arg[@]}" \
+                2>&1 | tee "${per_run_log}"
+            rc=${PIPESTATUS[0]}
+        else
+            python3 -m src.main \
+                +experiment="${EXPERIMENT}" \
+                wandb.mode=disabled \
+                wandb.name="${WANDB_NAME}" \
+                "dataset.re10k.roots=[${DATA_DIR}]" \
+                data_loader.train.batch_size="${BATCH_SIZE}" \
+                data_loader.train.num_workers="${NUM_WORKERS}" \
+                checkpointing.every_n_train_steps="${CKPT_EVERY}" \
+                checkpointing.save_top_k="${CKPT_KEEP}" \
+                checkpointing.save_weights_only=false \
+                checkpointing.resume=true \
+                trainer.val_check_interval="${VAL_INTERVAL}" \
+                "${run_resume_arg[@]}" \
+                2>&1 | tee "${per_run_log}"
+            rc=${PIPESTATUS[0]}
+        fi
+
+        # 合并日志
+        cat "${per_run_log}" >> "${out_path}/train.log"
+
+        # 0 = 正常完成（max_steps 到了），退出循环
+        if [[ ${rc} -eq 0 ]]; then
+            ok "训练正常完成 (attempt=${attempt})"
+            break
+        fi
+
+        # 禁用自动重启 → 退出
+        if [[ "${NO_AUTORESTART:-0}" == "1" ]]; then
+            err "训练退出 (rc=${rc})，NO_AUTORESTART=1 不自动重启"
+            break
+        fi
+
+        # 到达最大重启次数 → 放弃
+        if [[ ${attempt} -ge ${MAX_RESTARTS} ]]; then
+            err "训练崩溃 ${attempt} 次已达上限 (MAX_RESTARTS=${MAX_RESTARTS})，放弃"
+            break
+        fi
+
+        warn "训练崩溃 (rc=${rc})，尝试自动重启（第 $((attempt+1)) 次）..."
+
+        # 清理残留 torchrun/python 进程
+        pkill -9 -f "src.main" 2>/dev/null || true
+        pkill -9 -f "torchrun" 2>/dev/null || true
+        sleep 15  # 等 GPU 彻底释放
+
+        # 找最新 ckpt
+        local new_ckpt
+        new_ckpt=$(find "${WORK_DIR}/outputs" -path "*/checkpoints/*.ckpt" 2>/dev/null \
+            | xargs -I{} stat -c '%Y {}' {} 2>/dev/null | sort -n | tail -1 | awk '{print $2}')
+        if [[ -z "${new_ckpt}" || ! -f "${new_ckpt}" ]]; then
+            # xargs stat 方案失败，用修改时间的备选
+            new_ckpt=$(ls -t "${WORK_DIR}"/outputs/*/*/checkpoints/*.ckpt 2>/dev/null \
+                | head -1)
+        fi
+        if [[ -z "${new_ckpt}" || ! -f "${new_ckpt}" ]]; then
+            err "找不到 ckpt 可以 resume，放弃自动重启"
+            break
+        fi
+        info "从最新 ckpt 恢复: ${new_ckpt}"
+        run_resume_arg=( "checkpointing.load=${new_ckpt}" )
+    done
+
     [[ ${rc} -eq 0 ]] && ok "训练完成" || err "训练退出 (rc=${rc})"
     return ${rc}
 }
