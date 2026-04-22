@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from datetime import timedelta
 
 import hydra
 import torch
@@ -12,6 +13,7 @@ from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
+from lightning.pytorch.strategies import DDPStrategy
 from omegaconf import DictConfig, OmegaConf
 import uuid
 import time
@@ -137,17 +139,34 @@ def train(cfg_dict: DictConfig):
     # This allows the current step to be shared with the data loader processes.
     step_tracker = StepTracker()
 
+    # ---- NCCL timeout / DDP 配置 ----
+    # 背景：Lightning 默认 DDP allreduce timeout 是 30 分钟。字节/GCP 镜像的
+    # NCCL socket 后端偶发卡死（10-13h 一次，NumelIn=2189907 的 bucket），
+    # 等 30 分钟既浪费 GPU 也让 auto-restart 响应变慢。
+    # 设 300s = 5 分钟，让卡死尽快触发 SIGABRT，脚本能及时自动重启。
+    # 通过环境变量 DDP_TIMEOUT_SEC 可覆盖（默认 300s）。
+    ddp_timeout_sec = int(os.environ.get("DDP_TIMEOUT_SEC", "300"))
+    # DDP bucket 大小（MB）：默认 25MB。小 bucket = allreduce 更频繁但每次更小，
+    # 单个 bucket 卡死的概率变高，但单次卡死影响面也更小。设 5 能把上面 2.2M
+    # 元素的 bucket 拆开，某种意义上不再复现那个"固定 bucket 卡死"。
+    bucket_cap_mb = int(os.environ.get("DDP_BUCKET_CAP_MB", "5"))
+    if torch.cuda.device_count() > 1:
+        ddp_strategy = DDPStrategy(
+            find_unused_parameters=True,
+            timeout=timedelta(seconds=ddp_timeout_sec),
+            bucket_cap_mb=bucket_cap_mb,
+            gradient_as_bucket_view=True,  # 省显存 + 小优化
+        )
+    else:
+        ddp_strategy = "auto"
+
     trainer = Trainer(
         max_epochs=-1,
         num_nodes=cfg.trainer.num_nodes,
         accelerator="gpu",
         logger=logger,
         devices="auto",
-        strategy=(
-            "ddp_find_unused_parameters_true"
-            if torch.cuda.device_count() > 1
-            else "auto"
-        ),
+        strategy=ddp_strategy,
         callbacks=callbacks,
         val_check_interval=cfg.trainer.val_check_interval,
         check_val_every_n_epoch=None,
