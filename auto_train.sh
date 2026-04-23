@@ -323,6 +323,62 @@ stop_gpu_monitor() {
     fi
 }
 
+# ============================ Hang Watchdog（NCCL 死锁外部强杀） ============================
+# 背景：PyTorch 的 NCCL watchdog 自己会被 NCCL 死锁卡住，5 分钟 timeout 触发后，
+# 进程仍可能挂 10 小时不退出。表现：日志不再更新，但 torchrun 还在。
+#
+# 外部 watchdog：每 30s 检查训练日志 mtime，如果 HANG_TIMEOUT_SEC (默认 420s = 7 分钟)
+# 没有新行写入，就 kill -9 整个 torchrun 进程组，触发脚本的 auto-restart。
+#
+# 这是被迫加的兜底——字节/GCP 镜像 NCCL socket 后端在长跑后偶发死锁，目前没有
+# 更好的根治方案（换 NCCL 版本或换插件都需要镜像权限）。
+start_hang_watchdog() {
+    local log_file="$1"
+    local timeout_sec="${HANG_TIMEOUT_SEC:-420}"
+    (
+        # 等训练日志文件先出现，最多等 120s
+        local waited=0
+        while [[ ! -f "${log_file}" && ${waited} -lt 120 ]]; do
+            sleep 5
+            waited=$((waited + 5))
+        done
+        [[ ! -f "${log_file}" ]] && exit 0
+
+        while true; do
+            sleep 30
+            # 日志文件消失 → 训练已退出，watchdog 也退出
+            [[ ! -f "${log_file}" ]] && exit 0
+
+            # stale time = 现在 - 日志最后修改时间
+            local now mtime stale
+            now=$(date +%s)
+            mtime=$(stat -c '%Y' "${log_file}" 2>/dev/null || echo 0)
+            stale=$((now - mtime))
+
+            if [[ ${stale} -gt ${timeout_sec} ]]; then
+                echo "" >> "${log_file}"
+                echo "========================================" >> "${log_file}"
+                echo "[HANG WATCHDOG] 日志静默 ${stale}s > ${timeout_sec}s，判定 NCCL 死锁，强杀 torchrun" >> "${log_file}"
+                echo "========================================" >> "${log_file}"
+                pkill -9 -f "torchrun" 2>/dev/null || true
+                pkill -9 -f "src.main" 2>/dev/null || true
+                exit 0
+            fi
+        done
+    ) >/dev/null 2>&1 &
+    echo $! > "${MONITOR_DIR}/hang_watchdog.pid"
+    info "启动 Hang Watchdog (pid=$(cat ${MONITOR_DIR}/hang_watchdog.pid), timeout=${timeout_sec}s)"
+}
+
+stop_hang_watchdog() {
+    if [[ -f "${MONITOR_DIR}/hang_watchdog.pid" ]]; then
+        local pid
+        pid=$(cat "${MONITOR_DIR}/hang_watchdog.pid")
+        kill "${pid}" 2>/dev/null || true
+        rm -f "${MONITOR_DIR}/hang_watchdog.pid"
+    fi
+}
+
 # ============================ Step 3: 烟雾测试 ============================
 step3_smoke() {
     log "Step 3: 烟雾测试（300 step，验证 OOM 修复）"
@@ -483,6 +539,10 @@ step4_train() {
 
         local per_run_log="${out_path}/train_attempt${attempt}.log"
 
+        # 启动 hang watchdog（监控日志 freshness，7 分钟静默就强杀 torchrun）
+        rm -f "${per_run_log}"  # 清空避免旧 mtime 干扰
+        start_hang_watchdog "${per_run_log}"
+
         if [[ "${NUM_GPUS}" -ge 2 ]]; then
             torchrun --standalone --nproc_per_node="${NUM_GPUS}" \
                 -m src.main \
@@ -517,6 +577,9 @@ step4_train() {
                 2>&1 | tee "${per_run_log}"
             rc=${PIPESTATUS[0]}
         fi
+
+        # 训练退出后立刻关闭 hang watchdog
+        stop_hang_watchdog
 
         # 合并日志
         cat "${per_run_log}" >> "${out_path}/train.log"
@@ -580,7 +643,7 @@ main() {
     start_gpu_monitor
 
     # 清理陷阱：退出时停止监控
-    trap stop_gpu_monitor EXIT
+    trap 'stop_gpu_monitor; stop_hang_watchdog' EXIT
 
     step3_smoke    || { err "烟雾测试失败，请先修复再继续"; exit 1; }
 
